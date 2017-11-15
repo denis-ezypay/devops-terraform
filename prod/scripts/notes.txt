@@ -1,0 +1,59 @@
+terraforming help | grep terraforming | grep -v help | awk '{print "terraforming", $2, "--region", "ap-southeast-2", "--profile", "ezypay_sydney_vault_mfa", ">", $2".tf";}' | bash
+# find files that only have 1 empty line (likely nothing in AWS)
+find . -type f -name '*.tf' | xargs wc -l | grep ' 1 .'
+
+# Manually move to separate 'vault_environment' and 'cloud_billing' directories, to avoid having to re-download
+
+# Generate json version of security groups so they're easier to work with programmatically
+json2hcl --reverse < ../exported/sg.tf > sg.json
+
+# Copy nacl/sg/sn/vpc scripts, update sg with the necessary rules, and replace static ID's
+cat ../vault_environment/nacl.tf ../cloud_billing/nacl.tf > nacl.tf && cat ../vault_environment/sg.tf ../cloud_billing/sg.tf > sg.tf && cat ../vault_environment/sn.tf ../cloud_billing/sn.tf > sn.tf && cat ../vault_environment/elb.tf ../cloud_billing/elb.tf > elb.tf && json2hcl --reverse < sg.tf > sg.json && python convert_json_security_rules_to_hcl.py > sg.tf && python replace.py
+
+# Currently creating
+# sn
+# vpc
+# igw
+# peering connections - added as static
+# rt - added as static
+# nacl
+#  - single invalid rule created at top of document, should be removed manually
+# sg
+#  - single rule is exactly duplicated for CB, remove manually
+# elb
+#  - will be created with no instances attached (as expected)
+#  - server certificates will be missing
+
+# Ask terraform what is going to change, and parse the config for errors
+terraform plan
+
+# Need to update:
+# vpc_id (from vpc.tf)
+# vpc_zone_identifier/subnet_id/subnet_ids (from sn.tf)
+# zone_id (from r53z.tf)
+# instances (probably remove, currently in elb.tf)
+# bucket (from s3.tf)
+
+
+#! /usr/bin/env python
+
+import sys
+import boto3
+
+prompt_text = "Which profile do you want to use? {available_profiles}: "
+profile_name = sys.argv[1] if len(sys.argv) > 1 else raw_input(prompt_text.format(available_profiles=boto3.Session().available_profiles))
+
+session = boto3.Session(profile_name=profile_name)
+ec2 = session.client('ec2', region_name='ap-southeast-2')
+
+# Print Security groups and their names
+print "{vpc_id:15} | {id:15} | {name} ".format(vpc_id='VPC ID', name='Name', id='ID')
+for sg in sorted(ec2.describe_security_groups()['SecurityGroups'], key=lambda k: k['VpcId']+k['GroupId']):
+  print "{vpc_id:15} | {id:15} | '{name}'".format(vpc_id=sg['VpcId'],name=sg['GroupName'], id=sg['GroupId'])
+
+# Print Subnets
+print "{vpc_id:15} | {id:15} | {name} ".format(vpc_id='VPC ID', name='Name', id='ID')
+for sn in sorted(ec2.describe_subnets()['Subnets'], key=lambda k: k['VpcId']+k['SubnetId']):
+  tags = dict(map(lambda x: (x['Key'], x['Value']), sn['Tags'] or []))
+  name = tags.get('Name', None)
+  print "{vpc_id:15} | {id:15} | '{name}'".format(vpc_id=sn['VpcId'],name=name, id=sn['SubnetId'])
